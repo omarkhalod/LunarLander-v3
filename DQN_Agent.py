@@ -47,11 +47,11 @@ print("number of actions: ", action_size)
 
 
 # Hyperparameters
-learning_rate = 0.001
+learning_rate = 0.0005
 minibatch_size = 128
-discount_factor = 0.995
+discount_factor = 0.99
 replay_buffer_size = int(1e5)
-interpolation_parameter = 5e-3
+interpolation_parameter = 2e-3
 
 
 class ReplayMemory(object):
@@ -88,6 +88,8 @@ class ReplayMemory(object):
         return states, next_states, actions, rewards, dones
 
 
+
+
 class Agent():
     """DQN Agent that interacts with and learns from the environment."""
 
@@ -112,7 +114,7 @@ class Agent():
 
         self.memory.push((state, action, reward, next_state, done))
 
-        self.t_step = (self.t_step + 1) % 8
+        self.t_step = (self.t_step + 1) % 4
         if self.t_step == 0:
             if len(self.memory.memory) > minibatch_size:
                 experiences = self.memory.sample(minibatch_size)

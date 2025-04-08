@@ -1,3 +1,4 @@
 # Ignore Models and Video folders
 Models/
 Video/
+__pycache__/
