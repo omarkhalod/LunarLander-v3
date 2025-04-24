@@ -76,3 +76,5 @@ def show_video():
              </video>'''.format(encoded.decode('ascii'))))
     else:
         print("Could not find video")
+
+plot_scores(np.arange(5))

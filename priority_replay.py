@@ -61,14 +61,30 @@ class PriorityReplayMemory(object):
         # Normalize weights to have max weight = 1
         is_weights /= is_weights.max()
 
+
+
+         # Extract and convert experiences to tensors
+        states = torch.from_numpy(np.vstack(
+            [e[0] for e in batch if e is not None])).float().to(self.device)
+        actions = torch.from_numpy(
+            np.vstack([e[1] for e in batch if e is not None])).long().to(self.device)
+        rewards = torch.from_numpy(np.vstack(
+            [e[2] for e in batch if e is not None])).float().to(self.device)
+        next_states = torch.from_numpy(np.vstack(
+            [e[3] for e in batch if e is not None])).float().to(self.device)
+        dones = torch.from_numpy(np.vstack([e[4] for e in batch if e is not None]).astype(
+            np.uint8)).float().to(self.device)
+
+        batch = states, next_states, actions, rewards, dones
+        
         return batch, indices, is_weights
 
-def update_priorities(self, indices, td_errors):
-    """Update priorities based on TD errors"""
-    for idx, td_error in zip(indices, td_errors):
-        # Convert TD error to priority
-        priority = (abs(td_error) + self.epsilon) ** self.alpha
+    def update_priorities(self, indices, td_errors):
+        """Update priorities based on TD errors"""
+        for idx, td_error in zip(indices, td_errors):
+            # Convert TD error to priority
+            priority = (abs(td_error) + self.epsilon) ** self.alpha
         
-        # Update priority in tree
-        self.Pmemory.update(idx, priority)
+            # Update priority in tree
+            self.Pmemory.update(idx, priority)
         
