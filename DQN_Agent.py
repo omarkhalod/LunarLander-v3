@@ -1,17 +1,12 @@
+from Visualization import plot_scores, show_video_of_model
 import gymnasium as gym
 import random
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import glob
-import io
-import os
-import base64
-import imageio
-import matplotlib.pyplot as plt
-from IPython.display import HTML, display
 import torch.nn.functional as F
+import os
 from collections import deque
 from priority_replay import PriorityReplayMemory
 
@@ -48,11 +43,17 @@ print("number of actions: ", action_size)
 
 
 # Hyperparameters
-learning_rate = 0.0005
+learning_rate = 6e-4
 minibatch_size = 128
 discount_factor = 0.99
 replay_buffer_size = int(1e5)
 interpolation_parameter = 2e-3
+
+# seeding
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
 
 
 class ReplayMemory(object):
@@ -62,13 +63,11 @@ class ReplayMemory(object):
         self.device = torch.device(
             "cuda:0" if torch.cuda.is_available() else "cpu")
         self.capacity = capacity
-        self.memory = []
+        self.memory = deque(maxlen=capacity)
 
     def push(self, event):
         """Add a new experience to memory."""
         self.memory.append(event)
-        if len(self.memory) > self.capacity:
-            del self.memory[0]
 
     def sample(self, batch_size):
         """Randomly sample a batch of experiences from memory."""
@@ -89,8 +88,6 @@ class ReplayMemory(object):
         return states, next_states, actions, rewards, dones
 
 
-
-
 class Agent():
     """DQN Agent that interacts with and learns from the environment."""
 
@@ -103,6 +100,9 @@ class Agent():
 
         self.local_qnetwork = Network(state_size, action_size).to(self.device)
         self.target_qnetwork = Network(state_size, action_size).to(self.device)
+        self.target_qnetwork.load_state_dict(
+            self.local_qnetwork.state_dict())
+
         self.optimizer = optim.Adam(
             self.local_qnetwork.parameters(), lr=learning_rate)
 
@@ -121,7 +121,7 @@ class Agent():
                 experiences = self.memory.sample(minibatch_size)
                 self.learn(experiences, discount_factor)
 
-    def act(self, state, epsilion=0.):
+    def act(self, state, epsilon=0.):
         """Returns actions for given state as per current policy."""
         state = torch.from_numpy(state).float().unsqueeze(0).to(self.device)
 
@@ -133,7 +133,7 @@ class Agent():
         self.local_qnetwork.train()
 
         # Epsilon-Greedy Action Selection
-        if random.random() > epsilion:
+        if random.random() > epsilon:
             return np.argmax(action_values.cpu().data.numpy())  # Exploit
         else:
             return random.choice(np.arange(self.action_size))   # Explore
@@ -156,10 +156,12 @@ class Agent():
         q_targets = reward + (discount_factor * next_q_targets * (1 - done))
         q_expected = self.local_qnetwork(state).gather(1, action)
 
-
         loss = F.mse_loss(q_expected, q_targets)
         self.optimizer.zero_grad()
         loss.backward()
+        # to prevent exploding gradients
+        # torch.nn.utils.clip_grad_norm_(
+        #     self.local_qnetwork.parameters(), max_norm=1.0)
         self.optimizer.step()
 
         self.soft_update(self.local_qnetwork,
@@ -174,228 +176,114 @@ class Agent():
             )
 
 
-class AgentWithPR():
-    """DQN Agent that interacts with and learns from the environment."""
-
-    def __init__(self, state_size, action_size):
-        """Initialize an Agent object."""
+class AgentPR:
+    def __init__(self, state_dim, action_dim):
         self.device = torch.device(
             "cuda:0" if torch.cuda.is_available() else "cpu")
-        self.state_size = state_size
-        self.action_size = action_size
-
-        self.local_qnetwork = Network(state_size, action_size).to(self.device)
-        self.target_qnetwork = Network(state_size, action_size).to(self.device)
-        self.optimizer = optim.Adam(
-            self.local_qnetwork.parameters(), lr=learning_rate)
-
-        self.memory = PriorityReplayMemory(replay_buffer_size,epsilion)
-
+        self.local_qnetwork = Network(state_dim, action_dim).to(self.device)
+        self.target_qnetwork = Network(state_dim, action_dim).to(self.device)
+        self.target_qnetwork.load_state_dict(self.local_qnetwork.state_dict())
+        self.optimizer = optim.Adam(self.local_qnetwork.parameters(), lr=5e-4)
+        self.memory = PriorityReplayMemory(100000, alpha=0.8, epsilon=0.01)
+        self.gamma = 0.99
         self.t_step = 0
 
-    def step(self, state, action, reward, next_state, done):
-        """Save experience in replay memory, and use random sample to learn."""
-
-        self.memory.push((state, action, reward, next_state, done))
-
-        self.t_step = (self.t_step + 1) % 4
-        if self.t_step == 0:
-            if len(self.memory.memory) > minibatch_size:
-                experiences = self.memory.sample(minibatch_size)
-                self.learn(experiences, discount_factor)
-
-    def act(self, state, epsilion=0.):
-        """Returns actions for given state as per current policy."""
-        state = torch.from_numpy(state).float().unsqueeze(0).to(self.device)
-
+    def act(self, state, eps=0.9):
+        if random.random() < eps:
+            return random.randrange(self.local_qnetwork.fc3.out_features)
+        state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
         self.local_qnetwork.eval()
-
-        with torch.inference_mode():
-            action_values = self.local_qnetwork(state)
-
+        with torch.no_grad():
+            q = self.local_qnetwork(state)
         self.local_qnetwork.train()
+        return q.argmax().item()
 
-        # Epsilon-Greedy Action Selection
-        if random.random() > epsilion:
-            return np.argmax(action_values.cpu().data.numpy())  # Exploit
-        else:
-            return random.choice(np.arange(self.action_size))   # Explore
+    def step(self, state, action, reward, next_state, done):
+        self.memory.push((state, action, reward, next_state, done))
+        self.t_step = (self.t_step + 1) % 4
+        if self.t_step == 0 and self.memory.tree.n_entries > 128:
+            experiences = self.memory.sample(128)
+            self.learn(experiences)
 
-    def learn(self, experiences, discount_factor):
-        """Update value parameters using given batch of experience tuples."""
-        batch, indices, weights = experiences
-        state, next_state, action, reward, done= batch
-
-        self.target_qnetwork.eval()
-
-        # Compute Q targets for current states
-        # 1. Forward propagation to get predicted values (returns matrix of shape [batch_size, action_size])
-        # 2. .detach() ensures we don't update target network weights
-        # 3. max(1)[0] gets maximum Q-value for each batch sample
-        # 4. unsqueeze(1) reshapes from [batch_size] to [batch_size, 1]
-        next_q_targets = self.target_qnetwork(
-            next_state).detach().max(1)[0].unsqueeze(1)
-
-        # calculate target Q values using Bellman equation
-        q_targets = reward + (discount_factor * next_q_targets * (1 - done))
-        q_expected = self.local_qnetwork(state).gather(1, action)
-
-
-        td_error = (q_targets - q_expected).abs().detach()
-
-        #update the prioritys in the priority memory
-        for idx, error in zip(indices,td_error):
-            self.memory.update_priorities(idx,error)
-
-        loss = F.mse_loss(q_expected, q_targets)
+    def learn(self, experiences):
+        (states, actions, rewards, next_states,
+         dones), idxs, is_weights = experiences
+        # compute target
+        next_q = self.target_qnetwork(next_states).detach().max(1)[
+            0].unsqueeze(1)
+        target_q = rewards + self.gamma * next_q * (1 - dones)
+        # current Q
+        curr_q = self.local_qnetwork(states).gather(1, actions)
+        # compute loss
+        td_errors = F.mse_loss(curr_q, target_q, reduction='none')
+        loss = (is_weights * td_errors).mean()
+        # optimize
         self.optimizer.zero_grad()
+
         loss.backward()
+        # to prevent exploding gradients
+        # torch.nn.utils.clip_grad_norm_(
+        #     self.local_qnetwork.parameters(), max_norm=1.0)
         self.optimizer.step()
 
-        self.soft_update(self.local_qnetwork,
-                         self.target_qnetwork, interpolation_parameter)
-
-    def soft_update(self, local_model, target_modal, interpolation_parameter):
-        """Soft update model parameters: θ_target = τ*θ_local + (1 - τ)*θ_target"""
-        for target_param, local_param in zip(target_modal.parameters(), local_model.parameters()):
-            target_param.data.copy_(
-                interpolation_parameter * local_param.data +
-                (1.0 - interpolation_parameter) * target_param.data
-            )
+        # update priorities
+        errors = td_errors.detach().cpu().squeeze().tolist()
+        self.memory.update_priorities(idxs, errors)
+        # soft-update target
+        for t_param, l_param in zip(self.target_qnetwork.parameters(), self.local_qnetwork.parameters()):
+            t_param.data.copy_(2e-3*l_param.data + (1-2e-3)*t_param.data)
 
 
-agent = Agent(state_size, action_size)
+def trainging_loop(agent, number_of_episodes, max_number_of_timesteps_per_episode, epsilon_ending, epsilon_decay):
+    eps = 1.0
+    scores_window = deque(maxlen=100)
+
+    for episode in range(1, number_of_episodes + 1):
+        state, _ = env.reset(seed=SEED)
+        done = False
+        score = 0
+        t = 0
+        while not done and t < max_number_of_timesteps_per_episode:
+            action = agent.act(state, eps)
+            next_state, reward, term, trunc, _ = env.step(action)
+            done = term or trunc
+            score += reward
+            agent.step(state, action, reward, next_state, done)
+            state = next_state
+            t += 1
+
+        scores_window.append(score)
+        eps = max(epsilon_ending, epsilon_decay * eps)
+        print(
+            f"\rEpisode {episode:3d}	Average(100): {np.mean(scores_window):.2f}", end="")
+        if np.mean(scores_window) >= 200.0 and episode >= 100:
+            print(f"\nSolved in {episode - 100} episodes!")
+            os.makedirs('Models', exist_ok=True)
+            torch.save(agent.local_qnetwork.state_dict(),
+                       f'Models/checkpoint{episode - 100}.pth')
+            break
+
 
 # Training parameters
 number_of_episodes = 2000
 max_number_of_timesteps_per_episode = 1000
-epsilion_starting = 1.0
-epsilion_ending = 0.01
-epsilion_decay = 0.995
-epsilion = epsilion_starting
-score_for_100_episodes = deque(maxlen=minibatch_size)
-score_for_all_episodes = []
+epsilon_starting = 1.0
+epsilon_ending = 0.01
+epsilon_decay = 0.995
+
+agent = Agent(state_size, action_size)
+
+eps = epsilon_starting
 
 
-# Training loop
-def training():
-    for episode in range(1, number_of_episodes + 1):
-        state, _ = env.reset()
-        score = 0
+trainging_loop(agent, number_of_episodes, max_number_of_timesteps_per_episode,
+               epsilon_ending, epsilon_decay)
 
-        for t in range(max_number_of_timesteps_per_episode):
-            action = agent.act(state, epsilion)
-            next_state, reward, done, _, _ = env.step(action)
+agentPR = AgentPR(state_size, action_size)
 
-            agent.step(state, action, reward, next_state, done)
+trainging_loop(agentPR, number_of_episodes, max_number_of_timesteps_per_episode,
+               epsilon_ending, epsilon_decay)
 
-            state = next_state
-            score += reward
+show_video_of_model(agentPR, 'LunarLander-v3', "video_prioritized")
 
-            if done:
-                break
-
-        score_for_100_episodes.append(score)
-        epsilion = max(epsilion_ending, epsilion_decay * epsilion)
-
-        print('\rEpisode: {}\t Average Score: {:.2f}'.format(
-            episode, np.mean(score_for_100_episodes)), end="")
-
-        if (episode % 100 == 0):
-            score_for_all_episodes.append(np.mean(score_for_100_episodes))
-            print('\rEpisode: {}\t Average Score: {:.2f}'.format(
-                episode, np.mean(score_for_100_episodes)))
-            print(score_for_all_episodes)
-
-        if (np.mean(score_for_100_episodes) > 200.0):
-            print('\nEnviroment solved in {:d} Episodes!\tAverage Score: {:.2f}'.format(
-                episode - 100, np.mean(score_for_100_episodes)))
-            score_for_all_episodes.append(np.mean(score_for_100_episodes))
-            os.makedirs('Models', exist_ok=True)
-            torch.save(agent.local_qnetwork.state_dict(), 'Models/checkpoint.pth')
-            break
-
-
-# Visualization functions
-
-def plot_scores(scores):
-    """Plot the training scores over episodes."""
-    final_episode = len(score_for_all_episodes) * 100
-
-    episodes = []
-    plotted_scores = []
-
-    for i, score in enumerate(score_for_all_episodes):
-        episode_num = (i + 1) * 100
-        episodes.append(episode_num)
-        plotted_scores.append(score)
-
-    plt.figure(figsize=(12, 6))
-
-    plt.plot(episodes, plotted_scores, 'o-', color='blue', markersize=8,
-             linewidth=2, label="Average Score (per 100 episodes)")
-
-    plt.axhline(y=200, color='green', linestyle='--',
-                label="Solving Threshold (200)")
-
-    plt.xlim(0, final_episode + 10)
-
-    plt.grid(True, linestyle='--', alpha=0.7)
-    plt.xlabel("Episode", fontsize=12)
-    plt.ylabel("Average Score", fontsize=12)
-    plt.title("Training Performance - Deep Q-Learning on LunarLander", fontsize=14)
-
-    solving_episode = episodes[-1]
-    solving_score = plotted_scores[-1]
-    plt.annotate(f"Solved at episode {solving_episode}\nScore: {solving_score:.2f}",
-                 xy=(solving_episode, solving_score),
-                 xytext=(solving_episode-100, solving_score+20),
-                 arrowprops=dict(facecolor='black', shrink=0.05, width=1.5))
-
-    plt.legend(loc="lower right")
-    plt.tight_layout()
-    plt.show()
-
-
-plot_scores(score_for_all_episodes)
-
-
-def show_video_of_model(agent, env_name):
-    """Generate a video of the trained agent performance."""
-    env = gym.make(env_name, render_mode='rgb_array')
-    state, _ = env.reset()
-    done = False
-    frames = []
-
-    while not done:
-        frame = env.render()
-        frames.append(frame)
-        action = agent.act(state)
-        state, reward, done, _, _ = env.step(action.item())
-
-    env.close()
-    os.makedirs('Video', exist_ok=True)
-    imageio.mimsave('Video/video.mp4', frames, fps=30)
-
-
-# Generate video of trained agent
-show_video_of_model(agent, 'LunarLander-v3')
-
-
-def show_video():
-    """Display the generated MP4 video in the notebook."""
-    mp4list = glob.glob('*.mp4')
-    if len(mp4list) > 0:
-        mp4 = mp4list[0]
-        video = io.open(mp4, 'r+b').read()
-        encoded = base64.b64encode(video)
-        display(HTML(data='''<video alt="test" autoplay
-                loop controls style="height: 400px;">
-                <source src="data:video/mp4;base64,{0}" type="video/mp4" />
-             </video>'''.format(encoded.decode('ascii'))))
-    else:
-        print("Could not find video")
-
-
-# Display the video
-show_video()
+show_video_of_model(agent, 'LunarLander-v3', "video_standard")
