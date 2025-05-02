@@ -1,4 +1,4 @@
-from Visualization import plot_scores, show_video_of_model
+from Visualization import plot_comparison, show_video_of_model
 import gymnasium as gym
 import random
 import numpy as np
@@ -9,6 +9,8 @@ import torch.nn.functional as F
 import os
 from collections import deque
 from priority_replay import PriorityReplayMemory
+from linear_replay import ReplayMemory
+from MixedReplay import MixedReplayMemory
 
 
 class Network(nn.Module):
@@ -42,50 +44,35 @@ print("State size: ", state_size)
 print("number of actions: ", action_size)
 
 
-# Hyperparameters
-learning_rate = 6e-4
-minibatch_size = 128
-discount_factor = 0.99
-replay_buffer_size = int(1e5)
-interpolation_parameter = 2e-3
+# === TUNED HYPERPARAMETER SECTION ===
+LEARNING_RATE = 1e-3               # increased LR for faster convergence
+MINIBATCH_SIZE = 128               # smaller batch for more frequent updates
+DISCOUNT_FACTOR = 0.995            # slightly higher gamma for longer-term rewards
+REPLAY_BUFFER_SIZE = int(1e5)      # larger buffer to increase coverage
+INTERPOLATION_PARAMETER = 5e-3     # faster target-network blending
 
-# seeding
-SEED = 42
+ETA = 0.9                          # 90% PER, 10% uniform
+PER_EPSILON = 1e-4                 # very small floor to avoid zero priority
+PER_ALPHA = 0.7                    # stronger prioritization
+PER_BETA_START = 0.5               # start IS correction higher
+PER_BETA_FRAMES = 50000            # anneal beta over more frames
+
+EPSILON_STARTING = 1.0             # initial exploration rate
+EPSILON_ENDING = 0.01             # minimum exploration rate
+EPSILON_DECAY = 0.99              # slower decay for more exploration
+
+NUMBER_OF_EPISODES = 3000          # more episodes for deeper learning
+MAX_NUMBER_OF_TIMESTEPS_PER_EPISODE = 1000
+UPDATE_EVERY = 4                   # learn at every step
+
+SEED = 42                          # reproducibility
+
+# set seeds and initialize environment
+env = gym.make("LunarLander-v3")
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
-
-
-class ReplayMemory(object):
-    """Experience replay buffer to store and sample transitions."""
-
-    def __init__(self, capacity):
-        self.device = torch.device(
-            "cuda:0" if torch.cuda.is_available() else "cpu")
-        self.capacity = capacity
-        self.memory = deque(maxlen=capacity)
-
-    def push(self, event):
-        """Add a new experience to memory."""
-        self.memory.append(event)
-
-    def sample(self, batch_size):
-        """Randomly sample a batch of experiences from memory."""
-        experiences = random.sample(self.memory, k=batch_size)
-
-        # Extract and convert experiences to tensors
-        states = torch.from_numpy(np.vstack(
-            [e[0] for e in experiences if e is not None])).float().to(self.device)
-        actions = torch.from_numpy(
-            np.vstack([e[1] for e in experiences if e is not None])).long().to(self.device)
-        rewards = torch.from_numpy(np.vstack(
-            [e[2] for e in experiences if e is not None])).float().to(self.device)
-        next_states = torch.from_numpy(np.vstack(
-            [e[3] for e in experiences if e is not None])).float().to(self.device)
-        dones = torch.from_numpy(np.vstack([e[4] for e in experiences if e is not None]).astype(
-            np.uint8)).float().to(self.device)
-
-        return states, next_states, actions, rewards, dones
+env.reset(seed=SEED)
 
 
 class Agent():
@@ -104,9 +91,9 @@ class Agent():
             self.local_qnetwork.state_dict())
 
         self.optimizer = optim.Adam(
-            self.local_qnetwork.parameters(), lr=learning_rate)
+            self.local_qnetwork.parameters(), lr=LEARNING_RATE)
 
-        self.memory = ReplayMemory(replay_buffer_size)
+        self.memory = ReplayMemory(REPLAY_BUFFER_SIZE)
 
         self.t_step = 0
 
@@ -117,9 +104,9 @@ class Agent():
 
         self.t_step = (self.t_step + 1) % 4
         if self.t_step == 0:
-            if len(self.memory.memory) > minibatch_size:
-                experiences = self.memory.sample(minibatch_size)
-                self.learn(experiences, discount_factor)
+            if len(self.memory.memory) > MINIBATCH_SIZE:
+                experiences = self.memory.sample(MINIBATCH_SIZE)
+                self.learn(experiences, DISCOUNT_FACTOR)
 
     def act(self, state, epsilon=0.):
         """Returns actions for given state as per current policy."""
@@ -165,7 +152,7 @@ class Agent():
         self.optimizer.step()
 
         self.soft_update(self.local_qnetwork,
-                         self.target_qnetwork, interpolation_parameter)
+                         self.target_qnetwork, INTERPOLATION_PARAMETER)
 
     def soft_update(self, local_model, target_modal, interpolation_parameter):
         """Soft update model parameters: θ_target = τ*θ_local + (1 - τ)*θ_target"""
@@ -183,9 +170,10 @@ class AgentPR:
         self.local_qnetwork = Network(state_dim, action_dim).to(self.device)
         self.target_qnetwork = Network(state_dim, action_dim).to(self.device)
         self.target_qnetwork.load_state_dict(self.local_qnetwork.state_dict())
-        self.optimizer = optim.Adam(self.local_qnetwork.parameters(), lr=5e-4)
-        self.memory = PriorityReplayMemory(100000, alpha=0.8, epsilon=0.01)
-        self.gamma = 0.99
+        self.optimizer = optim.Adam(
+            self.local_qnetwork.parameters(), LEARNING_RATE)
+        self.memory = PriorityReplayMemory(
+            REPLAY_BUFFER_SIZE, alpha=0.8, epsilon=0.01)
         self.t_step = 0
 
     def act(self, state, eps=0.9):
@@ -211,7 +199,7 @@ class AgentPR:
         # compute target
         next_q = self.target_qnetwork(next_states).detach().max(1)[
             0].unsqueeze(1)
-        target_q = rewards + self.gamma * next_q * (1 - dones)
+        target_q = rewards + DISCOUNT_FACTOR * next_q * (1 - dones)
         # current Q
         curr_q = self.local_qnetwork(states).gather(1, actions)
         # compute loss
@@ -228,62 +216,146 @@ class AgentPR:
 
         # update priorities
         errors = td_errors.detach().cpu().squeeze().tolist()
-        self.memory.update_priorities(idxs, errors)
+        if (ETA > 0):
+            self.memory.update_priorities(idxs, errors)
+        # soft-update target network
+        self.soft_update(self.local_qnetwork,
+                         self.target_qnetwork, INTERPOLATION_PARAMETER)
+
+    def soft_update(self, local_model, target_modal, interpolation_parameter):
+        """Soft update model parameters: θ_target = τ*θ_local + (1 - τ)*θ_target"""
+        for target_param, local_param in zip(target_modal.parameters(), local_model.parameters()):
+            target_param.data.copy_(
+                interpolation_parameter * local_param.data +
+                (1.0 - interpolation_parameter) * target_param.data
+            )
+
+
+class AgentMR:
+    def __init__(self, state_dim, action_dim):
+        self.device = torch.device(
+            "cuda:0" if torch.cuda.is_available() else "cpu")
+        self.local_qnetwork = Network(state_dim, action_dim).to(self.device)
+        self.target_qnetwork = Network(state_dim, action_dim).to(self.device)
+        self.target_qnetwork.load_state_dict(self.local_qnetwork.state_dict())
+        self.optimizer = optim.Adam(
+            self.local_qnetwork.parameters(), lr=LEARNING_RATE)
+        self.memory = MixedReplayMemory(
+            REPLAY_BUFFER_SIZE,
+            eta=ETA,
+            epsilon=PER_EPSILON,
+            alpha=PER_ALPHA,
+            beta_start=PER_BETA_START,
+            beta_frames=PER_BETA_FRAMES
+        )
+        self.gamma = 0.99
+        self.t_step = 0
+
+    def act(self, state, eps=0.9):
+        if random.random() < eps:
+            return random.randrange(self.local_qnetwork.fc3.out_features)
+        state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+        self.local_qnetwork.eval()
+        with torch.no_grad():
+            q = self.local_qnetwork(state)
+        self.local_qnetwork.train()
+        return q.argmax().item()
+
+    def step(self, state, action, reward, next_state, done):
+        self.memory.push((state, action, reward, next_state, done))
+        self.t_step = (self.t_step + 1) % UPDATE_EVERY
+        if self.t_step == 0 and self.memory.per.tree.n_entries > MINIBATCH_SIZE:
+            experiences = self.memory.sample(MINIBATCH_SIZE)
+            self.learn(experiences)
+
+    def learn(self, experiences):
+        (states, actions, rewards, next_states,
+         dones), idxs, is_weights = experiences
+        # compute targets
+        next_q = self.target_qnetwork(next_states).detach().max(1)[
+            0].unsqueeze(1)
+        q_targets = rewards + self.gamma * next_q * (1 - dones)
+        # expected
+        q_expected = self.local_qnetwork(states).gather(1, actions)
+        # loss with IS weights
+        td_errors = (q_expected - q_targets).detach().cpu().squeeze().numpy()
+        loss = (is_weights * F.mse_loss(q_expected,
+                q_targets, reduction='none')).mean()
+        # optimize
+        self.optimizer.zero_grad()
+        loss.backward()
+        # to prevent exploding gradients
+        torch.nn.utils.clip_grad_norm_(
+            self.local_qnetwork.parameters(), max_norm=1.0)
+        self.optimizer.step()
+        # update priorities
+        self.memory.update_priorities(idxs, td_errors)
         # soft-update target
-        for t_param, l_param in zip(self.target_qnetwork.parameters(), self.local_qnetwork.parameters()):
-            t_param.data.copy_(2e-3*l_param.data + (1-2e-3)*t_param.data)
+        self.soft_update(self.local_qnetwork,
+                         self.target_qnetwork, INTERPOLATION_PARAMETER)
+
+    def soft_update(self, local_model, target_modal, interpolation_parameter):
+        """Soft update model parameters: θ_target = τ*θ_local + (1 - τ)*θ_target"""
+        for target_param, local_param in zip(target_modal.parameters(), local_model.parameters()):
+            target_param.data.copy_(
+                interpolation_parameter * local_param.data +
+                (1.0 - interpolation_parameter) * target_param.data
+            )
 
 
-def trainging_loop(agent, number_of_episodes, max_number_of_timesteps_per_episode, epsilon_ending, epsilon_decay):
-    eps = 1.0
+def trainging_loop(agent):
+    eps = EPSILON_STARTING
+    replay_type = 'PR' if ETA == 1 else 'LR' if ETA == 0 else 'MR'
+    scores_avr = np.array([-200.])
     scores_window = deque(maxlen=100)
-
-    for episode in range(1, number_of_episodes + 1):
-        state, _ = env.reset(seed=SEED)
-        done = False
-        score = 0
-        t = 0
-        while not done and t < max_number_of_timesteps_per_episode:
+    for ep in range(1, NUMBER_OF_EPISODES + 1):
+        state, _ = env.reset()
+        done, score, t = False, 0, 0
+        while not done and t < MAX_NUMBER_OF_TIMESTEPS_PER_EPISODE:
             action = agent.act(state, eps)
             next_state, reward, term, trunc, _ = env.step(action)
             done = term or trunc
-            score += reward
             agent.step(state, action, reward, next_state, done)
             state = next_state
+            score += reward
             t += 1
-
         scores_window.append(score)
-        eps = max(epsilon_ending, epsilon_decay * eps)
+        eps = max(EPSILON_ENDING, EPSILON_DECAY * eps)
         print(
-            f"\rEpisode {episode:3d}	Average(100): {np.mean(scores_window):.2f}", end="")
-        if np.mean(scores_window) >= 200.0 and episode >= 100:
-            print(f"\nSolved in {episode - 100} episodes!")
+            f"\rEpisode {ep:4d} Avg(100): {np.mean(scores_window):.2f}", end="")
+        if (ep % 10 == 0):
+            scores_avr = np.append(scores_avr, np.mean(scores_window))
+        if np.mean(scores_window) >= 200.0 and ep >= 100:
+            print(f"\nSolved in {ep-100} episodes!")
+            scores_avr = np.append(scores_avr, np.mean(scores_window))
             os.makedirs('Models', exist_ok=True)
             torch.save(agent.local_qnetwork.state_dict(),
-                       f'Models/checkpoint{episode - 100}.pth')
+                       f'Models/checkpoint{ep-100}_{replay_type}.pth')
             break
 
-
-# Training parameters
-number_of_episodes = 2000
-max_number_of_timesteps_per_episode = 1000
-epsilon_starting = 1.0
-epsilon_ending = 0.01
-epsilon_decay = 0.995
-
-agent = Agent(state_size, action_size)
-
-eps = epsilon_starting
+    return scores_avr
 
 
-trainging_loop(agent, number_of_episodes, max_number_of_timesteps_per_episode,
-               epsilon_ending, epsilon_decay)
+if __name__ == '__main__':
+    state_size = env.observation_space.shape[0]
+    action_size = env.action_space.n
+    # priority
+    ETA = 1
+    agent = AgentMR(state_size, action_size)
+    score_pr = trainging_loop(agent)
+    show_video_of_model(agent, "LunarLander-v3", "video_priority")
 
-agentPR = AgentPR(state_size, action_size)
+    # linear
+    ETA = 0
+    agent = AgentMR(state_size, action_size)
+    score_lr = trainging_loop(agent)
+    show_video_of_model(agent, "LunarLander-v3", "video_linear")
 
-trainging_loop(agentPR, number_of_episodes, max_number_of_timesteps_per_episode,
-               epsilon_ending, epsilon_decay)
+    # mixed
+    ETA = 0.6
+    agent = AgentMR(state_size, action_size)
+    score_mr = trainging_loop(agent)
 
-show_video_of_model(agentPR, 'LunarLander-v3', "video_prioritized")
+    show_video_of_model(agent, "LunarLander-v3", "video_mixed")
 
-show_video_of_model(agent, 'LunarLander-v3', "video_standard")
+    plot_comparison(score_lr, score_pr, score_mr)

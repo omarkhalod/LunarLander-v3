@@ -12,33 +12,29 @@ def __init__(self):
     self.frames = []
 
 
-def plot_scores(scores):
-    """Plot the training scores over episodes."""
-    final_episode = len(scores) * 100
-    episodes = []
-    plotted_scores = []
-    for i, score in enumerate(scores):
-        episode_num = (i + 1) * 100
-        episodes.append(episode_num)
-        plotted_scores.append(score)
-    plt.figure(figsize=(12, 6))
-    plt.plot(episodes, plotted_scores, 'o-', color='blue', markersize=8,
-             linewidth=2, label="Average Score (per 100 episodes)")
-    plt.axhline(y=200, color='green', linestyle='--',
-                label="Solving Threshold (200)")
-    plt.xlim(0, final_episode + 10)
-    plt.grid(True, linestyle='--', alpha=0.7)
-    plt.xlabel("Episode", fontsize=12)
-    plt.ylabel("Average Score", fontsize=12)
-    plt.title(
-        "Training Performance - Deep Q-Learning on LunarLander", fontsize=14)
-    solving_episode = episodes[-1]
-    solving_score = plotted_scores[-1]
-    plt.annotate(f"Solved at episode {solving_episode}\nScore: {solving_score:.2f}",
-                 xy=(solving_episode, solving_score),
-                 xytext=(solving_episode-100, solving_score+20),
-                 arrowprops=dict(facecolor='black', shrink=0.05, width=1.5))
-    plt.legend(loc="lower right")
+def plot_comparison(scores_lr, scores_pr, scores_mr):
+    """
+    Plot training performance for three agents:
+      - scores_lr: list of average scores per episode for Linear Replay
+      - scores_pr: list of average scores per episode for Prioritized Replay
+      - scores_mr: list of average scores per episode for Mixed Replay
+    Handles different lengths by plotting each over its own episode range.
+    """
+    # Compute episode indices for each score list
+    eps_lr = list(range(1, len(scores_lr) + 1))
+    eps_pr = list(range(1, len(scores_pr) + 1))
+    eps_mr = list(range(1, len(scores_mr) + 1))
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(eps_lr, scores_lr, label='Linear Replay')
+    plt.plot(eps_pr, scores_pr, label='Prioritized Replay')
+    plt.plot(eps_mr, scores_mr, label='Mixed Replay')
+
+    plt.xlabel('Episode')
+    plt.ylabel('Average Reward (100-episode window)')
+    plt.title('DQN Replay Buffer Comparison')
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.5)
     plt.tight_layout()
     plt.show()
 
